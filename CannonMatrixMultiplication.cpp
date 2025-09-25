@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <mpi.h>
 #include <math.h>
+#include <time.h>
 
 // Matrix allocation (contiguous)
 int allocMatrix(int*** mat, int rows, int cols) {
@@ -20,9 +21,24 @@ int allocMatrix(int*** mat, int rows, int cols) {
 }
 
 int freeMatrix(int*** mat) {
+    if (!mat || !*mat) return -1;
     free(&((*mat)[0][0]));
     free(*mat);
     return 0;
+}
+
+// Generate a random square matrix
+void generate_matrix(int** mat, int dim) {
+    // Seed with a value that is the same for all processes initially
+    // but allow rank 0 to control the true seed time.
+    srand(1);
+    if (mat) { // Ensure matrix is not NULL
+        for (int i = 0; i < dim; i++) {
+            for (int j = 0; j < dim; j++) {
+                mat[i][j] = rand() % 10; // Random values 0-9
+            }
+        }
+    }
 }
 
 // Serial matrix multiplication: C = A*B
@@ -47,7 +63,7 @@ int validate_result(int** A, int** B, int** C_mpi, int M, int K, int N) {
     serial_matmul(A, B, C_expected, M, K, N);
 
     int valid = 1;
-    for (int i = 0; i < M; i++)
+    for (int i = 0; i < M; i++) {
         for (int j = 0; j < N; j++) {
             if (C_expected[i][j] != C_mpi[i][j]) {
                 printf("[Validation Failed] C[%d][%d]: expected %d, got %d\n", i, j, C_expected[i][j], C_mpi[i][j]);
@@ -55,6 +71,8 @@ int validate_result(int** A, int** B, int** C_mpi, int M, int K, int N) {
                 break;
             }
         }
+        if (!valid) break;
+    }
 
     freeMatrix(&C_expected);
     return valid;
@@ -79,235 +97,179 @@ int main(int argc, char* argv[]) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &worldSize);
 
-    int rows = 0, columns = 0;
+    int rows = 0;
     int procDim = 0, blockDim = 0;
-    int **A = NULL, **B = NULL, **C = NULL;         // Global matrices on rank 0
-    int **localA = NULL, **localB = NULL, **localC = NULL; // Local blocks
+    int **A = NULL, **B = NULL, **C = NULL;
+    int **localA = NULL, **localB = NULL, **localC = NULL;
     MPI_Comm cartComm;
     int dim[2], period[2], reorder = 1;
     int coords[2];
 
     if (rank == 0) {
-        FILE* fp = fopen("A.txt", "r");
-        if (!fp) {
-            printf("[ERROR] Cannot open A.txt\n");
+        if (argc < 2) {
+            fprintf(stderr, "Usage: mpirun -np <num_procs> %s <matrix_order>\n", argv[0]);
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
-        // Count rows and columns
-        int n, count = 0;
-        char ch;
-        rows = 0;
-        while (fscanf(fp, "%d", &n) != EOF) {
-            count++;
-            ch = fgetc(fp);
-            if (ch == '\n' || ch == EOF) rows++;
-        }
-        columns = count / rows;
-        if (rows != columns) {
-            printf("[ERROR] Only square matrices supported!\n");
+        rows = atoi(argv[1]);
+        if (rows <= 0) {
+            fprintf(stderr, "[ERROR] Matrix order must be a positive integer.\n");
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
+
         double root = sqrt(worldSize);
         if ((root - floor(root)) != 0) {
-            printf("[ERROR] Number of processes must be perfect square!\n");
+            fprintf(stderr, "[ERROR] Number of processes must be a perfect square!\n");
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
         procDim = (int)root;
         if (rows % procDim != 0) {
-            printf("[ERROR] Matrix size not divisible by sqrt(processes)\n");
+            fprintf(stderr, "[ERROR] Matrix size not divisible by sqrt(processes)\n");
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
         blockDim = rows / procDim;
 
-        fseek(fp, 0, SEEK_SET);
-        if (allocMatrix(&A, rows, columns) != 0 || allocMatrix(&B, rows, columns) != 0 || allocMatrix(&C, rows, columns) != 0) {
-            printf("[ERROR] Allocation failed on rank 0\n");
+        if (allocMatrix(&A, rows, rows) != 0 || allocMatrix(&B, rows, rows) != 0 || allocMatrix(&C, rows, rows) != 0) {
+            fprintf(stderr, "[ERROR] Allocation failed on rank 0\n");
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
-        // Read matrix A
-        for (int i = 0; i < rows; i++)
-            for (int j = 0; j < columns; j++)
-                fscanf(fp, "%d", &A[i][j]);
-        fclose(fp);
 
-        fp = fopen("B.txt", "r");
-        if (!fp) {
-            printf("[ERROR] Cannot open B.txt\n");
-            MPI_Abort(MPI_COMM_WORLD, 1);
+        // Seed random number generator on rank 0 only
+        srand(time(NULL));
+        generate_matrix(A, rows);
+        generate_matrix(B, rows);
+
+        if (rows < 10) {
+            printf("Matrix A:\n");
+            for(int i=0; i<rows; i++) { for(int j=0; j<rows; j++) printf("%d ", A[i][j]); printf("\n"); }
+            printf("\nMatrix B:\n");
+            for(int i=0; i<rows; i++) { for(int j=0; j<rows; j++) printf("%d ", B[i][j]); printf("\n"); }
         }
-        for (int i = 0; i < rows; i++)
-            for (int j = 0; j < columns; j++)
-                fscanf(fp, "%d", &B[i][j]);
-        fclose(fp);
-
-        // Initialize C to zero
-        for (int i = 0; i < rows; i++)
-            for (int j = 0; j < columns; j++)
-                C[i][j] = 0;
     }
 
-    // Broadcast matrix info to all
-    int meta[3]; // procDim, blockDim, rows (rows=columns)
+    int meta[2];
     if (rank == 0) {
         meta[0] = procDim;
         meta[1] = blockDim;
-        meta[2] = rows;
     }
-    MPI_Bcast(meta, 3, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(meta, 2, MPI_INT, 0, MPI_COMM_WORLD);
     procDim = meta[0];
     blockDim = meta[1];
-    rows = meta[2];
-    columns = rows;
+    rows = procDim * blockDim; // Recalculate rows for all processes
 
-    // Create Cartesian communicator
     dim[0] = procDim; dim[1] = procDim;
-    period[0] = 1; period[1] = 1; // Periodic for Cannon's algorithm
+    period[0] = 1; period[1] = 1;
     MPI_Cart_create(MPI_COMM_WORLD, 2, dim, period, reorder, &cartComm);
     MPI_Cart_coords(cartComm, rank, 2, coords);
 
-    // Allocate local blocks
     if (allocMatrix(&localA, blockDim, blockDim) != 0 ||
         allocMatrix(&localB, blockDim, blockDim) != 0 ||
         allocMatrix(&localC, blockDim, blockDim) != 0) {
-        printf("[ERROR] Local allocation failed on rank %d\n", rank);
+        fprintf(stderr, "[ERROR] Local allocation failed on rank %d\n", rank);
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
-    // --------- Manual Scatter of A and B -----------
+    MPI_Datatype blocktype, blocktype_resized;
+    MPI_Type_vector(blockDim, blockDim, rows, MPI_INT, &blocktype);
+    MPI_Type_create_resized(blocktype, 0, sizeof(int), &blocktype_resized);
+    MPI_Type_commit(&blocktype_resized);
+
+    int* sendcounts = (int*)malloc(worldSize * sizeof(int));
+    int* displs = (int*)malloc(worldSize * sizeof(int));
 
     if (rank == 0) {
-        // Send blocks to other processes
-        for (int p = 0; p < worldSize; p++) {
+        for (int i = 0; i < worldSize; i++) {
+            sendcounts[i] = 1;
             int p_coords[2];
-            MPI_Cart_coords(cartComm, p, 2, p_coords);
-            int row_start = p_coords[0] * blockDim;
-            int col_start = p_coords[1] * blockDim;
-
-            // Prepare block buffer
-            int* blockA = (int*)malloc(blockDim * blockDim * sizeof(int));
-            int* blockB = (int*)malloc(blockDim * blockDim * sizeof(int));
-
-            for (int i = 0; i < blockDim; i++)
-                for (int j = 0; j < blockDim; j++) {
-                    blockA[i * blockDim + j] = A[row_start + i][col_start + j];
-                    blockB[i * blockDim + j] = B[row_start + i][col_start + j];
-                }
-
-            if (p == 0) {
-                // Copy directly to local blocks on rank 0
-                for (int i = 0; i < blockDim; i++)
-                    for (int j = 0; j < blockDim; j++) {
-                        localA[i][j] = blockA[i * blockDim + j];
-                        localB[i][j] = blockB[i * blockDim + j];
-                    }
-            }
-            else {
-                MPI_Send(blockA, blockDim * blockDim, MPI_INT, p, 0, MPI_COMM_WORLD);
-                MPI_Send(blockB, blockDim * blockDim, MPI_INT, p, 1, MPI_COMM_WORLD);
-            }
-
-            free(blockA);
-            free(blockB);
+            MPI_Cart_coords(cartComm, i, 2, p_coords);
+            displs[i] = (p_coords[0] * rows * blockDim) + (p_coords[1] * blockDim);
         }
     }
-    else {
-        // Receive local blocks
-        int* blockA = (int*)malloc(blockDim * blockDim * sizeof(int));
-        int* blockB = (int*)malloc(blockDim * blockDim * sizeof(int));
 
-        MPI_Recv(blockA, blockDim * blockDim, MPI_INT, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        MPI_Recv(blockB, blockDim * blockDim, MPI_INT, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    int* A_ptr = (rank == 0) ? &(A[0][0]) : NULL;
+    int* B_ptr = (rank == 0) ? &(B[0][0]) : NULL;
+    MPI_Scatterv(A_ptr, sendcounts, displs, blocktype_resized, &(localA[0][0]), blockDim * blockDim, MPI_INT, 0, cartComm);
+    MPI_Scatterv(B_ptr, sendcounts, displs, blocktype_resized, &(localB[0][0]), blockDim * blockDim, MPI_INT, 0, cartComm);
 
-        // Copy to local matrices
-        for (int i = 0; i < blockDim; i++)
-            for (int j = 0; j < blockDim; j++) {
-                localA[i][j] = blockA[i * blockDim + j];
-                localB[i][j] = blockB[i * blockDim + j];
-            }
+    free(sendcounts);
+    free(displs);
+    MPI_Type_free(&blocktype);
+    MPI_Type_free(&blocktype_resized);
 
-        free(blockA);
-        free(blockB);
-    }
-
-    // Initialize localC to zero
     for (int i = 0; i < blockDim; i++)
         for (int j = 0; j < blockDim; j++)
             localC[i][j] = 0;
 
-    // -------- Initial skewing for Cannon's algorithm ------------
+    // ----------- TIMING CODE START -----------
+    double start_time, end_time;
+    MPI_Barrier(cartComm); // Synchronize all processes before starting the timer
+    if (rank == 0) {
+        start_time = MPI_Wtime();
+    }
+    // ----------- TIMING CODE START -----------
 
-    // Shift A left by row coordinate times
     int shift_source, shift_dest;
     MPI_Cart_shift(cartComm, 1, -coords[0], &shift_source, &shift_dest);
     MPI_Sendrecv_replace(&(localA[0][0]), blockDim * blockDim, MPI_INT, shift_dest, 10, shift_source, 10, cartComm, MPI_STATUS_IGNORE);
 
-    // Shift B up by column coordinate times
     MPI_Cart_shift(cartComm, 0, -coords[1], &shift_source, &shift_dest);
     MPI_Sendrecv_replace(&(localB[0][0]), blockDim * blockDim, MPI_INT, shift_dest, 20, shift_source, 20, cartComm, MPI_STATUS_IGNORE);
 
-    // --------- Cannon's algorithm main loop -----------
     for (int step = 0; step < procDim; step++) {
-        // Multiply local blocks and accumulate in localC
         matrixMultiply(localA, localB, blockDim, localC);
 
-        // Shift A left by 1
         MPI_Cart_shift(cartComm, 1, -1, &shift_source, &shift_dest);
         MPI_Sendrecv_replace(&(localA[0][0]), blockDim * blockDim, MPI_INT, shift_dest, 30, shift_source, 30, cartComm, MPI_STATUS_IGNORE);
 
-        // Shift B up by 1
         MPI_Cart_shift(cartComm, 0, -1, &shift_source, &shift_dest);
         MPI_Sendrecv_replace(&(localB[0][0]), blockDim * blockDim, MPI_INT, shift_dest, 40, shift_source, 40, cartComm, MPI_STATUS_IGNORE);
     }
+    
+    // ----------- TIMING CODE END -----------
+    MPI_Barrier(cartComm); // Synchronize all processes before stopping the timer
+    if (rank == 0) {
+        end_time = MPI_Wtime();
+        printf("Parallel calculation took %f seconds.\n", end_time - start_time);
+    }
+    // ----------- TIMING CODE END -----------
 
-    // -------- Manual gather of localC blocks to rank 0 ---------
+
+    MPI_Datatype gathertype, gathertype_resized;
+    MPI_Type_vector(blockDim, blockDim, rows, MPI_INT, &gathertype);
+    MPI_Type_create_resized(gathertype, 0, sizeof(int), &gathertype_resized);
+    MPI_Type_commit(&gathertype_resized);
+
+    int* recvcounts = (int*)malloc(worldSize * sizeof(int));
+    int* recvdispls = (int*)malloc(worldSize * sizeof(int));
 
     if (rank == 0) {
-        // Copy own localC into global C
-        for (int i = 0; i < blockDim; i++)
-            for (int j = 0; j < blockDim; j++) {
-                C[i][j] = localC[i][j];
-            }
-
-        // Receive other blocks
-        for (int p = 1; p < worldSize; p++) {
+        for (int i = 0; i < worldSize; i++) {
+            recvcounts[i] = 1;
             int p_coords[2];
-            MPI_Cart_coords(cartComm, p, 2, p_coords);
-            int row_start = p_coords[0] * blockDim;
-            int col_start = p_coords[1] * blockDim;
-
-            int* blockC = (int*)malloc(blockDim * blockDim * sizeof(int));
-            MPI_Recv(blockC, blockDim * blockDim, MPI_INT, p, 50, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-
-            for (int i = 0; i < blockDim; i++)
-                for (int j = 0; j < blockDim; j++) {
-                    C[row_start + i][col_start + j] = blockC[i * blockDim + j];
-                }
-
-            free(blockC);
+            MPI_Cart_coords(cartComm, i, 2, p_coords);
+            recvdispls[i] = (p_coords[0] * rows * blockDim) + (p_coords[1] * blockDim);
         }
     }
-    else {
-        // Send localC block to rank 0
-        int* blockC = (int*)malloc(blockDim * blockDim * sizeof(int));
-        for (int i = 0; i < blockDim; i++)
-            for (int j = 0; j < blockDim; j++) {
-                blockC[i * blockDim + j] = localC[i][j];
-            }
-        MPI_Send(blockC, blockDim * blockDim, MPI_INT, 0, 50, MPI_COMM_WORLD);
-        free(blockC);
-    }
 
-    // Rank 0 prints and validates the result
+    int* C_ptr = (rank == 0) ? &(C[0][0]) : NULL;
+    MPI_Gatherv(&(localC[0][0]), blockDim * blockDim, MPI_INT, C_ptr, recvcounts, recvdispls, gathertype_resized, 0, cartComm);
+
+    free(recvcounts);
+    free(recvdispls);
+    MPI_Type_free(&gathertype);
+    MPI_Type_free(&gathertype_resized);
+
     if (rank == 0) {
-        printf("Result matrix C:\n");
-        for (int i = 0; i < rows; i++) {
-            for (int j = 0; j < columns; j++) {
-                printf("%d ", C[i][j]);
+        if (rows < 10) {
+            printf("\nResult matrix C:\n");
+            for (int i = 0; i < rows; i++) {
+                for (int j = 0; j < rows; j++) {
+                    printf("%d ", C[i][j]);
+                }
+                printf("\n");
             }
-            printf("\n");
         }
 
-        int valid = validate_result(A, B, C, rows, columns, columns);
+        int valid = validate_result(A, B, C, rows, rows, rows);
         if (valid)
             printf("[SUCCESS] Result validated correctly!\n");
         else
